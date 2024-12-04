@@ -1,0 +1,357 @@
+# Distributed tracing demo
+
+```elixir
+:inets.start()
+
+packages = [
+  {:opentelemetry_exporter, "~> 1.8"},
+  {:opentelemetry, "~> 1.5"},
+  {:opentelemetry_api, "~> 1.4"},
+  {:opentelemetry_process_propagator, "~> 0.3.0"},
+  {:opentelemetry_telemetry, "~> 1.1"},
+  {:telemetry, "~> 1.3"}
+]
+
+config = [
+  opentelemetry: [
+    resource: %{service: %{name: "livebook"}},
+    span_processor: :simple,
+    traces_exporter: :otlp
+  ],
+  opentelemetry_exporter: [
+    otlp_protocol: :http_protobuf,
+    otlp_endpoint: "http://localhost:4318"
+  ]
+]
+
+Mix.install(packages, config: config)
+```
+
+## start Jaeger
+
+start Jaeger as proposed in the [Getting Started](https://www.jaegertracing.io/docs/2.0/getting-started/#in-docker) tutorial:
+
+```
+docker run --rm --name jaeger \
+  -p 16686:16686 \
+  -p 4318:4318 \
+  jaegertracing/jaeger:2.0.0 \
+  --set receivers.otlp.protocols.http.endpoint=0.0.0.0:4318
+```
+
+and then open [Jaeger UI](http://localhost:16686)
+
+## spans demo
+
+```elixir
+require OpenTelemetry.Tracer, as: Tracer
+
+linked_span_ctx = Tracer.with_span :linked_span do
+  Tracer.current_span_ctx()
+end
+
+Tracer.with_span :root_span, %{links: [linked_span_ctx]} do
+  Process.sleep(200)
+  Tracer.set_attributes([{"some attribute", "five"}])
+  Tracer.with_span "nested span" do
+    Process.sleep(100)
+    Tracer.add_event("Event 1", [{"event attribute", 100}])
+    Tracer.set_attributes([{:another_attributes, :yes}])
+    Process.sleep(200)
+  end
+  Tracer.set_attributes([{"yet another attribute", "4"}])
+  Tracer.add_event("Event 2", [{:event_attribute, "some value"}])
+  Tracer.set_status(:error)
+  Process.sleep(200)
+end
+```
+
+## span context demo
+
+```elixir
+defmodule SpanConvertor do
+  @span_record Record.extract(:span, from: "#{:code.lib_dir(:opentelemetry)}/include/otel_span.hrl")
+  @span_fields Keyword.keys(@span_record)
+
+  def span_to_map(span_record) do
+    [:span | span_data] = :erlang.tuple_to_list(span_record)
+    :maps.from_list(:lists.zip(@span_fields, span_data))
+  end
+  
+  def print_spans(span_records, opts \\ []) do
+    span_records |> Enum.map(&span_to_map/1) |> IO.inspect(opts)
+  end
+end 
+
+```
+
+```elixir
+require OpenTelemetry.Tracer, as: Tracer
+alias OpenTelemetry.Ctx
+alias OpenTelemetry.Baggage
+import SpanConvertor
+
+linked_span_ctx = Tracer.with_span :some_linked_span do
+  Tracer.current_span_ctx()
+end
+
+Tracer.with_span :context_span_demo, %{links: [linked_span_ctx]} do
+  Tracer.set_attributes([{"some attribute", "five"}])
+  Tracer.set_status(:error)
+  Tracer.add_event("Event 1", [{"event attribute", 100}])
+  Baggage.set("some baggage", "taking it with me")
+
+  Ctx.get_current() |> IO.inspect(label: "span context")
+
+  :ets.tab2list(:otel_span_table) |> print_spans(label: "SPAN_TAB")
+end
+
+:ok
+```
+
+## Interal context propagation
+
+### Example with the race condition (for set_attributes/1 call) and loss of baggage
+
+```elixir
+require OpenTelemetry.Tracer, as: Tracer
+alias OpenTelemetry.Ctx
+alias OpenTelemetry.Baggage
+
+Tracer.with_span :buggy_context_propagation do
+  parent_ctx = Ctx.get_current()
+  Baggage.set("some baggage", "taking it with me")
+  async_fn = fn ->
+               token = Ctx.attach(parent_ctx)
+               Tracer.with_span :child do
+                 :ok ## some external http request here
+               end
+               Tracer.set_attributes([{"some attribute", "some_value"}])
+               Ctx.detach(token)
+             end
+  Task.async(async_fn)
+  Process.sleep(300) ## just some more actions here
+end
+```
+
+### Fixed example
+
+```elixir
+require OpenTelemetry.Tracer, as: Tracer
+alias OpenTelemetry.Ctx
+alias OpenTelemetry.Baggage
+
+Tracer.with_span :fixed_context_propagation do
+  Baggage.set("some baggage", "taking it with me")
+  parent_ctx = OpenTelemetry.Ctx.get_current()
+  async_fn = fn ->
+               token = Ctx.attach(parent_ctx)
+               Tracer.with_span :child do
+                 :ok  ## some external http request here
+               end
+               Tracer.set_attributes([{"some attribute", "some_value"}])
+               Ctx.detach(token)
+             end
+  task = Task.async(async_fn)
+  ## just some more actions here
+  Task.await(task)
+end
+```
+
+### Improved example
+
+Now the Task can be safely spawned on another node
+
+```elixir
+require OpenTelemetry.Tracer, as: Tracer
+alias OpenTelemetry.Ctx
+alias OpenTelemetry.Baggage
+
+Tracer.with_span :better_context_propagation do
+  Baggage.set("some baggage", "taking it with me")
+  parent_ctx = Ctx.get_current()
+  async_fn = fn ->
+               Tracer.with_span parent_ctx, :child, %{} do
+                 :ok
+               end
+               "some_value"
+             end
+  task = Task.async(async_fn)
+  ## just some more actions here
+  attr_value = Task.await(task)
+  Tracer.set_attributes([{"some attribute", attr_value}])
+end
+```
+
+## external context propagation
+
+```elixir
+require OpenTelemetry.Tracer, as: Tracer
+alias OpenTelemetry.Ctx
+alias OpenTelemetry.Baggage
+
+## producer service code
+headers = Tracer.with_span :external_context_propagation_root, %{kind: :producer} do
+            Baggage.set("some baggage", "taking it with me")
+            Ctx.get_current() |> IO.inspect(label: "root span context")
+            :otel_propagator_text_map.inject([])
+          end |> IO.inspect(label: "headers")
+
+Process.sleep(300)
+
+## consumer service code
+restored_context = :otel_propagator_text_map.extract_to(Ctx.new(), headers)
+
+Tracer.with_span restored_context, :external_context_propagation_child, %{kind: :consumer} do
+  Ctx.get_current() |> IO.inspect(label: "child span context")
+end
+```
+
+## error span status
+
+Example with invalid span status (status is not set automatically on error)
+
+```elixir
+require OpenTelemetry.Tracer, as: Tracer
+
+try do
+  Tracer.with_span :buggy_span_with_error do
+    raise "some error"
+  end
+rescue
+  e in RuntimeError ->
+    e |> IO.inspect(label: "error")
+end
+```
+
+Fixed example
+
+```elixir
+require OpenTelemetry.Tracer, as: Tracer
+
+Tracer.with_span :span_with_error do
+  try do
+     raise "some error"
+  rescue
+    e in RuntimeError ->
+      Tracer.set_status(:error, e.message)
+  end
+end
+```
+
+## OpentelemetryProcessPropagator
+
+```elixir
+require OpenTelemetry.Tracer, as: Tracer
+
+Tracer.with_span :parent_with_propagator do
+  async_fn = fn ->
+               parent_ctx = OpentelemetryProcessPropagator.fetch_parent_ctx(1, :"$callers")
+               IO.inspect(parent_ctx, label: :parent_ctx)
+               Tracer.with_span parent_ctx, :child_with_propagator, %{} do
+                 :ok
+               end
+             end
+  task = Task.async(async_fn)
+  _ = Task.await(task)
+end
+```
+
+Example with the race condition
+
+```elixir
+require OpenTelemetry.Tracer, as: Tracer
+
+Tracer.with_span :buggy_parent_with_propagator do
+  async_fn = fn ->
+               Process.sleep(500)
+               parent_ctx = OpentelemetryProcessPropagator.fetch_parent_ctx(1, :"$callers")
+               IO.inspect(parent_ctx, label: :parent_ctx)
+               Tracer.with_span parent_ctx, :buggy_child_with_propagator, %{} do
+                 :ok
+               end
+             end
+  Task.async(async_fn)
+end
+```
+
+## OpenTelemetry vs. :telemetry (single event example)
+
+```elixir
+require OpenTelemetry.Tracer, as: Tracer
+alias OpenTelemetry.Ctx
+alias OpenTelemetry.Span
+
+handle_event = fn(event, measurements, _metadata, _config) ->
+                  start_time = :opentelemetry.timestamp() - measurements.duration
+                  ctx = Ctx.get_current()
+                  span = Tracer.start_span(ctx, :telemtry_event_span,
+                                           %{start_time: start_time})
+                  Span.set_attribute(span, :event, "#{inspect(event)}")
+                  Span.end_span(span)
+
+               end
+
+:telemetry.detach("event handler")
+:telemetry.attach_many("event handler",
+                       [[:span, :processing, :stop],
+                        [:span, :processing, :exception]],
+                       handle_event, %{})
+
+:telemetry.span([:span, :processing], %{}, fn -> {:span_result, %{}} end)
+```
+
+## OpentelemetryTelemetry
+
+```elixir
+defmodule EventHandler do
+  @tracer_id __MODULE__
+  
+  def handle_event([:span, :processing, :start], %{monotonic_time: start_time},
+                   metadata, _config) do
+    start_opts = %{start_time: start_time}
+    OpentelemetryTelemetry.start_telemetry_span(@tracer_id, :telemetry_demo,
+                                                metadata, start_opts)
+    :ok
+  end
+
+  def handle_event([:span, :processing, :stop], _measurements,
+                   metadata, _config) do
+      OpentelemetryTelemetry.set_current_telemetry_span(@tracer_id, metadata)
+      OpentelemetryTelemetry.end_telemetry_span(@tracer_id, metadata)
+      :ok
+  end
+
+  def handle_event([:span, :processing, :exception], _measurements,
+                   %{kind: kind, reason: reason} = metadata, _config) do
+      OpentelemetryTelemetry.set_current_telemetry_span(@tracer_id, metadata)
+      OpenTelemetry.Tracer.set_status(:error, "#{inspect(kind)}: #{inspect(reason)}")
+      OpentelemetryTelemetry.end_telemetry_span(@tracer_id, metadata)
+      :ok
+    end
+        
+  def handle_event(_event, _measurements, _metadata, _config), do: :ok
+end
+```
+
+```elixir
+:telemetry.detach("event handler")
+:telemetry.attach_many("event handler",
+                       [[:span, :processing, :start],
+                        [:span, :processing, :stop],
+                        [:span, :processing, :exception]],
+                       &EventHandler.handle_event/4, %{})
+
+:telemetry.span([:span, :processing], %{},
+                fn -> 
+                  Tracer.with_span :nested_span do
+                    {:span_result, %{}}
+                  end
+                end)
+try do
+  :telemetry.span([:span, :processing], %{},
+                  fn -> raise "some error" end)
+rescue
+  _ -> :ignore_this_error
+end
+```
